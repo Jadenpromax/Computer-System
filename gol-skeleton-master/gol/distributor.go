@@ -2,7 +2,7 @@ package gol
 
 import (
 	"fmt"
-
+	"sync"
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
@@ -40,56 +40,65 @@ func distributor(p Params, c distributorChannels) {
 	c.events <- StateChange{turn, Executing}
 
 	// Execute all turns of the Game of Life.
+	//try to implement a parallel version
+	// 根据params中的线程决定多少个worker
+	//create a number of workers based on the number of threads specified in params.threads
+	workers :=p.Threads
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > p.ImageHeight {
+		workers = p.ImageHeight
+	}
+    //each worker will be respnsible for a portion of the image, and will calculate the next state of the cells in that portion.
 	for turn < p.Turns {
 		nextWorld := make([][]uint8, p.ImageHeight)
 
-		for y := 0; y < p.ImageHeight; y++ {
+		for y:= range nextWorld {
 			nextWorld[y] = make([]uint8, p.ImageWidth)
 		}
+		var wg sync.WaitGroup
 
-		for y := 0; y < p.ImageHeight; y++ {
-			for x := 0; x < p.ImageWidth; x++ {
-				aliveNeighbours := 0
-
-				// 检查周围八个位置
-				for dy := -1; dy <= 1; dy++ {
-					for dx := -1; dx <= 1; dx++ {
-						// 不统计当前细胞自己
-						if dx == 0 && dy == 0 {
-							continue
+		for worker := 0; worker < workers; worker++ {
+			startY := worker * p.ImageHeight / workers
+			endY := (worker + 1) * p.ImageHeight / workers
+			//splite
+			wg.Add(1)
+			go func(startY,endY int) {
+				defer wg.Done()
+				//calculate of course
+				for y := startY; y < endY; y++ {
+					for x := 0; x < p.ImageWidth; x++ {
+						aliveNeighbours:=0
+						for dy := -1; dy <= 1; dy++ {
+							for dx := -1; dx <= 1; dx++{
+								if dx ==0 && dy == 0{
+									continue
+								}
+								nx := (x + dx + p.ImageWidth) % p.ImageWidth
+								ny := (y + dy + p.ImageHeight) % p.ImageHeight
+								if world[ny][nx] == 255 {
+									aliveNeighbours++
+								}
+							}
 						}
-
-						// 环绕边界
-						neighbourX := (x + dx + p.ImageWidth) % p.ImageWidth
-						neighbourY := (y + dy + p.ImageHeight) % p.ImageHeight
-
-						if world[neighbourY][neighbourX] == 255 {
-							aliveNeighbours++
+						
+						if world[y][x] == 255 {
+							if aliveNeighbours == 2 || aliveNeighbours == 3{
+								nextWorld[y][x]=255
+							}
+						
+						}	else if aliveNeighbours == 3 {
+						nextWorld[y][x]=255
 						}
 					}
 				}
-
-				// 当前细胞是活细胞
-				if world[y][x] == 255 {
-					if aliveNeighbours == 2 || aliveNeighbours == 3 {
-						nextWorld[y][x] = 255
-					} else {
-						nextWorld[y][x] = 0
-					}
-				} else {
-					// 当前细胞是死细胞
-					if aliveNeighbours == 3 {
-						nextWorld[y][x] = 255
-					} else {
-						nextWorld[y][x] = 0
-					}
-				}
-			}
+			}(startY,endY)
 		}
-
+		wg.Wait()
 		world = nextWorld
 		turn++
-	}
+	}		
 
 	// Report the final state using FinalTurnCompleteEvent.
 	aliveCells := make([]util.Cell, 0)
