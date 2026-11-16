@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"uk.ac.bris.cs/gameoflife/util"
+	"time"
 )
 
 type distributorChannels struct {
@@ -38,6 +39,9 @@ func distributor(p Params, c distributorChannels) {
 
 	turn := 0
 	c.events <- StateChange{turn, Executing}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 
 	// Execute all turns of the Game of Life.
 	//try to implement a parallel version
@@ -98,6 +102,16 @@ func distributor(p Params, c distributorChannels) {
 		wg.Wait()
 		world = nextWorld
 		turn++
+
+		select {
+		case <- ticker.C:
+			count := countAliveNeighbours(world)
+			c.events <- AliveCellsCount{
+				CompletedTurns: turn,
+				CellsCount: count,
+			}
+		default:
+		}
 	}		
 
 	// Report the final state using FinalTurnCompleteEvent.
@@ -125,4 +139,18 @@ func distributor(p Params, c distributorChannels) {
 	c.events <- StateChange{turn, Quitting}
 	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
 	close(c.events)
+}
+
+
+
+func countAliveNeighbours(world [][]uint8) int{
+	count := 0
+	for y :=range world {
+		for x := range world[y]{
+			if world[y][x] == 255{
+				count++
+			}
+		}
+	}
+	return count
 }
