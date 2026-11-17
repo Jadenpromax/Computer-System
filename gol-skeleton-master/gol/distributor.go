@@ -128,6 +128,26 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}
 
+	//Its for step 4
+	filename := fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, turn)
+	c.ioCommand <- ioOutput
+	c.ioFilename <- filename
+	for y:=0 ; y < p.ImageHeight; y++ {
+		for x := 0 ; x < p.ImageWidth; x++ {
+			c.ioOutput <- world[y][x]
+		}
+	}
+
+	c.ioCommand <- ioCheckIdle
+	<-c.ioIdle
+
+	c.events <- ImageOutputComplete{
+		CompletedTurns: turn,
+		Filename:       filename,
+	}
+
+
+
 	c.events <- FinalTurnComplete{
 		CompletedTurns: turn,
 		Alive:          aliveCells,
