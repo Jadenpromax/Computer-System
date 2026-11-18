@@ -158,6 +158,8 @@ func distributor(p Params, c distributorChannels) {
 		}
 		wg.Wait()
 
+		completedTurns := turn + 1
+
 		//compare the current world and the next world to find which cells have changed state,and send a CellsFlipped
 		//event to the GUI for each cell that has changed state
 		flipped := make([]util.Cell, 0)
@@ -172,7 +174,8 @@ func distributor(p Params, c distributorChannels) {
 
 
 		world = nextWorld
-		turn++
+		turn= completedTurns
+
 
 		if len(flipped)>0{
 			c.events <- CellsFlipped{
@@ -181,6 +184,9 @@ func distributor(p Params, c distributorChannels) {
 			}
 		}
 
+		c.events <- TurnComplete{
+			CompletedTurns: turn,
+		}
 
 		select {
 		case <- ticker.C:
