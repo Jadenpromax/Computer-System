@@ -33,6 +33,7 @@ func Run(p Params, events chan<- Event, keyPresses <-chan rune) {
 		ioFilename: ioFilename,
 		ioOutput:   ioOutput,
 		ioInput:    ioInput,
+		keyPress: keyPresses,//马勒戈壁这个那么阴
 	}
 	distributor(p, distributorChannels)
 }
