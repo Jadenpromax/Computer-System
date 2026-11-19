@@ -49,6 +49,14 @@ func main() {
 		false,
 		"Disable the SDL window for running in a headless environment.")
 
+
+	flag.StringVar(
+		&params.EngineAddress,
+		"engine",
+		"127.0.0.1:8030",
+		"Address of the Game of Life engine.",
+)
+
 	flag.Parse()
 
 	log.Printf("[Main] %-10v %v", "Threads", params.Threads)

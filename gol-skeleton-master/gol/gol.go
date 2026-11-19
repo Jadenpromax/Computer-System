@@ -6,10 +6,15 @@ type Params struct {
 	Threads     int
 	ImageWidth  int
 	ImageHeight int
+	EngineAddress string
 }
 
 // Run starts the processing of Game of Life. It should initialise channels and goroutines.
 func Run(p Params, events chan<- Event, keyPresses <-chan rune) {
+	// If the engine address is not provided, use the default address.
+	if p.EngineAddress == "" {
+    p.EngineAddress = "127.0.0.1:8030"
+	}
 
 	ioFilename := make(chan string)
 	ioOutput := make(chan uint8)
