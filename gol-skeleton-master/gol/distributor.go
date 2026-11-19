@@ -47,26 +47,63 @@ func distributor(p Params, c distributorChannels) {
 		panic(fmt.Errorf("connect to Game of Life engine: %w", err))
 	}
 	defer client.Close()
-
-	//start the evolution in the engine
-	var startReply StartReply
-	if err := client.Call("GolEngine.StartEvolution", EvolveRequest{
-		World:   world,
+	// runResponse carries the blocking RunGame RPC result back to the distributor loop,
+	// so it can keep handling key presses and progress events while the call is in flight.
+	type runResponse struct {
+		result GameResult
+		err    error
+	}
+	runDone := make(chan runResponse, 1)
+	request := EvolveRequest{
+		World:   cloneWorld(world),
 		Turns:   p.Turns,
 		Threads: p.Threads,
-	}, &startReply); err != nil {
-		panic(fmt.Errorf("start evolution via RPC: %w", err))
 	}
-	//help to implement the 's' and 'p'
+
+	// RunGame blocks until all turns finish, so call it concurrently while the
+	// distributor continues handling key presses and progress events.
+	go func() {
+		var result GameResult
+		err := client.Call("GolEngine.RunGame", request, &result)
+		runDone <- runResponse{result: result, err: err}
+	}()
+
+	// Wait until the blocking RunGame RPC has initialized the broker state.
 	fetchSnapshot := func() Snapshot {
 		var snapshot Snapshot
 		if err := client.Call("GolEngine.GetSnapshot", Empty{}, &snapshot); err != nil {
 			panic(fmt.Errorf("get engine snapshot: %w", err))
 		}
+		if snapshot.Error != "" {
+			panic(fmt.Errorf("engine computation failed: %s", snapshot.Error))
+		}
 		return snapshot
 	}
 
-	state := fetchSnapshot()
+	var completion *runResponse
+	var state Snapshot
+	startupTicker := time.NewTicker(time.Millisecond)
+
+	// Wait until the broker initializes the world. If RunGame finishes first, use
+	// its final result; otherwise, fetch snapshots until the world is available.
+	for len(state.World) == 0 {
+		select {
+		case result := <-runDone:
+			if result.err != nil {
+				panic(fmt.Errorf("run game via RPC: %w", result.err))
+			}
+			completion = &result
+			state = Snapshot{
+				World:          result.result.World,
+				CompletedTurns: result.result.CompletedTurns,
+				Finished:       true,
+			}
+		case <-startupTicker.C:
+			state = fetchSnapshot()
+		}
+	}
+	startupTicker.Stop()
+
 	world = state.World
 	turn := state.CompletedTurns
 	paused := state.Paused
@@ -130,13 +167,32 @@ func distributor(p Params, c distributorChannels) {
 		c.events <- StateChange{turn, Quitting}
 	}
 
+	if completion != nil {
+		finish(state)
+		return
+	}
+	//keep tracking runDown, aliveTicker and keyPress
 	for {
 		select {
+		case result := <-runDone:
+			if result.err != nil {
+				panic(fmt.Errorf("run game via RPC: %w", result.err))
+			}
+			finish(Snapshot{
+				World:          result.result.World,
+				CompletedTurns: result.result.CompletedTurns,
+				Finished:       true,
+			})
+			return
+
 		case <-aliveTicker.C:
 			var countReply AliveCountReply
 			err := client.Call("GolEngine.GetAliveCells", AliveCountRequest{}, &countReply)
 			if err != nil {
 				panic(fmt.Errorf("get alive-cell count: %w", err))
+			}
+			if countReply.Error != "" {
+				panic(fmt.Errorf("engine computation failed: %s", countReply.Error))
 			}
 			c.events <- AliveCellsCount{
 				CompletedTurns: countReply.CompletedTurns,
@@ -159,11 +215,6 @@ func distributor(p Params, c distributorChannels) {
 				c.events <- StateChange{turn, newState}
 			}
 
-			if state.Finished {
-				finish(state)
-				return
-			}
-
 		case key, ok := <-c.keyPress:
 			if !ok {
 				c.keyPress = nil
@@ -179,6 +230,9 @@ func distributor(p Params, c distributorChannels) {
 				var snapshot Snapshot
 				if err := client.Call(method, Empty{}, &snapshot); err != nil {
 					panic(fmt.Errorf("change engine pause state: %w", err))
+				}
+				if snapshot.Error != "" {
+					panic(fmt.Errorf("engine computation failed: %s", snapshot.Error))
 				}
 				applySnapshot(snapshot)
 				paused = snapshot.Paused
@@ -206,7 +260,15 @@ func distributor(p Params, c distributorChannels) {
 				if err := client.Call("GolEngine.Shutdown", Empty{}, &shutdownReply); err != nil {
 					panic(fmt.Errorf("shut down Game of Life engine: %w", err))
 				}
-				finish(fetchSnapshot())
+				result := <-runDone
+				if result.err != nil {
+					panic(fmt.Errorf("run game via RPC: %w", result.err))
+				}
+				finish(Snapshot{
+					World:          result.result.World,
+					CompletedTurns: result.result.CompletedTurns,
+					Finished:       true,
+				})
 				return
 			}
 		}
