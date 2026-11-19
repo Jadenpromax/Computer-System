@@ -22,7 +22,46 @@ type EvolveReply struct {
 	Result []TurnResult
 }
 
-type Engine struct {}
+type Engine struct {
+	mu sync.RWMutex
+	world [][]uint8
+	completedTurns int
+}
+
+
+type AliveCountRequest struct{}
+
+type AliveCountReply struct{
+	CompletedTurns int
+	CellsCount int
+}
+
+//moved from controller to engine 
+func countAliveCells(world [][]uint8) int{
+	count := 0
+	for y :=range world {
+		for x := range world[y]{
+			if world[y][x] == 255{
+				count++
+			}
+		}
+	}
+	return count
+}
+
+
+// GetAliveCells returns the number of alive cells in the current world state.
+func (e *Engine) GetAliveCells(_ AliveCountRequest, reply *AliveCountReply) error {
+    e.mu.RLock()
+    world := e.world
+    turn := e.completedTurns
+    e.mu.RUnlock()
+
+    reply.CompletedTurns = turn
+    reply.CellsCount = countAliveCells(world)
+    return nil
+}
+
 
 func (e *Engine) Evolve(req EvolveRequest, reply *EvolveReply) error {
     if req.Turns < 0 {
@@ -33,6 +72,10 @@ func (e *Engine) Evolve(req EvolveRequest, reply *EvolveReply) error {
     }
 
     world := req.World
+	e.mu.Lock()
+	e.world = world
+	e.completedTurns = 0
+	e.mu.Unlock()
     for turn := 0; turn < req.Turns; turn++ {
         next := evolveOneTurn(world, req.Threads)
 
@@ -46,6 +89,10 @@ func (e *Engine) Evolve(req EvolveRequest, reply *EvolveReply) error {
         }
 
         world = next
+		e.mu.Lock()
+		e.world = world
+		e.completedTurns = turn + 1
+		e.mu.Unlock()
         reply.Result = append(reply.Result, TurnResult{
             CompletedTurns: turn + 1,
             Flipped:        flipped,

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/rpc"
 	"uk.ac.bris.cs/gameoflife/util"
+	"time"
 )
 
 type distributorChannels struct {
@@ -63,13 +64,37 @@ func distributor(p Params, c distributorChannels) {
 	defer client.Close()
 
 	var reply EvolveReply
-	err = client.Call("GolEngine.Evolve", EvolveRequest{
-		World:   world,
-		Turns:   p.Turns,
-		Threads: p.Threads,
-	}, &reply)
-	if err != nil {
-		panic(fmt.Errorf("evolve world via RPC: %w", err))
+	evolveDone := make(chan error,1)
+	go func() {
+		evolveDone <- client.Call("GolEngine.Evolve", EvolveRequest{
+			World:   world,
+			Turns:   p.Turns,
+			Threads: p.Threads,
+		}, &reply)
+	}()
+	
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	evolving := true
+	for evolving {
+		select {
+		case <-ticker.C:
+			var countReply AliveCountReply
+			err := client.Call("GolEngine.GetAliveCells", AliveCountRequest{}, &countReply)
+			if err != nil {
+				panic(fmt.Errorf("get alive-cell count: %w", err))
+			}
+			c.events<-AliveCellsCount{
+				CompletedTurns: countReply.CompletedTurns,
+				CellsCount:     countReply.CellsCount,
+			}
+		case err := <-evolveDone:
+			if err !=nil {
+				panic(fmt.Errorf("evolve world via RPC: %w", err))
+			}
+			evolving = false
+		}
 	}
 
 	world = reply.World
@@ -142,14 +167,4 @@ func outputWorld(c distributorChannels,world [][]uint8,turn int){
 
 
 
-func countAliveNeighbours(world [][]uint8) int{
-	count := 0
-	for y :=range world {
-		for x := range world[y]{
-			if world[y][x] == 255{
-				count++
-			}
-		}
-	}
-	return count
-}
+
