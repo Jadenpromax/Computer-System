@@ -41,4 +41,5 @@ func Run(p Params, events chan<- Event, keyPresses <-chan rune) {
 		keyPress: keyPresses,//马勒戈壁这个那么阴
 	}
 	distributor(p, distributorChannels)
+	close(ioCommand)
 }
