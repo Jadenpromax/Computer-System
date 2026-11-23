@@ -11,6 +11,7 @@ type EvolveRequest struct {
 	World   [][]uint8
 	Turns   int
 	Threads int
+	GameID  string
 }
 
 // Empty is an empty struct used for RPC methods that do not require any input parameters.
@@ -23,6 +24,13 @@ type StartReply struct {
 type GameResult struct {
 	World          [][]uint8
 	CompletedTurns int
+}
+
+type gameRun struct {
+	done           chan struct{}
+	world          [][]uint8
+	completedTurns int
+	err            error
 }
 
 type Engine struct {
@@ -41,6 +49,8 @@ type Engine struct {
 	stopSignalClosed bool
 	workerClients    []*rpc.Client
 	runError         string
+	currentRun       *gameRun
+	gameID           string
 }
 
 type Snapshot struct {
@@ -49,6 +59,7 @@ type Snapshot struct {
 	Paused         bool
 	Finished       bool
 	Error          string
+	GameID         string
 }
 
 type AliveCountRequest struct{}
@@ -60,6 +71,7 @@ type AliveCountReply struct {
 	Paused         bool
 	Finished       bool
 	Error          string
+	GameID         string
 }
 
 // moved from controller to engine
@@ -85,6 +97,7 @@ func (e *Engine) GetAliveCells(_ AliveCountRequest, reply *AliveCountReply) erro
 	reply.Paused = e.paused
 	reply.Finished = e.finished
 	reply.Error = e.runError
+	reply.GameID = e.gameID
 	return nil
 }
 
@@ -105,10 +118,11 @@ func (e *Engine) GetSnapshot(_ Empty, reply *Snapshot) error {
 	reply.Paused = e.paused
 	reply.Finished = e.finished
 	reply.Error = e.runError
+	reply.GameID = e.gameID
 	return nil
 }
 
-//initialization
+// initialization
 func NewEngine() *Engine {
 	e := &Engine{stopSignal: make(chan struct{})}
 	e.cond = sync.NewCond(&e.mu)
@@ -154,17 +168,8 @@ func (e *Engine) SetWorkers(addresses []string) error {
 }
 
 func (e *Engine) StartEvolution(req EvolveRequest, reply *StartReply) error {
-	if req.Turns < 0 {
-		return fmt.Errorf("turns cannot be negative")
-	}
-	if len(req.World) == 0 || len(req.World[0]) == 0 {
-		return fmt.Errorf("world cannot be empty")
-	}
-	width := len(req.World[0])
-	for _, row := range req.World {
-		if len(row) != width {
-			return fmt.Errorf("world rows have inconsistent widths")
-		}
+	if err := validateEvolveRequest(req); err != nil {
+		return err
 	}
 
 	e.mu.Lock()
@@ -180,49 +185,109 @@ func (e *Engine) StartEvolution(req EvolveRequest, reply *StartReply) error {
 	e.targetTurns = req.Turns
 	e.threads = req.Threads
 	e.completedTurns = 0
+	e.gameID = req.GameID
 	e.started = true
+	run := &gameRun{done: make(chan struct{})}
+	e.currentRun = run
 	reply.Started = true
-	go e.run()
+	go e.run(run)
 	return nil
 }
 
-//main RPC for Broker
+func validateEvolveRequest(req EvolveRequest) error {
+	if req.Turns < 0 {
+		return fmt.Errorf("turns cannot be negative")
+	}
+	if len(req.World) == 0 || len(req.World[0]) == 0 {
+		return fmt.Errorf("world cannot be empty")
+	}
+	width := len(req.World[0])
+	for _, row := range req.World {
+		if len(row) != width {
+			return fmt.Errorf("world rows have inconsistent widths")
+		}
+	}
+	return nil
+}
+
+// main RPC for Broker
 func (e *Engine) RunGame(req EvolveRequest, reply *GameResult) error {
-	var startReply StartReply
-    //start
-	if err := e.StartEvolution(req, &startReply); err != nil {
+	if err := validateEvolveRequest(req); err != nil {
 		return err
 	}
-    //wait
+
 	e.mu.Lock()
-	for !e.finished {
-		e.cond.Wait()
+	if e.stopping {
+		e.mu.Unlock()
+		return fmt.Errorf("engine is shutting down")
 	}
-    //save
-	reply.World = cloneWorld(e.world)
-	reply.CompletedTurns = e.completedTurns
-	runError := e.runError
+	if e.currentRun != nil && !e.finished {
+		e.currentRun.world = cloneWorld(e.world)
+		e.currentRun.completedTurns = e.completedTurns
+		e.currentRun.err = fmt.Errorf("game was replaced by a newer request")
+		close(e.currentRun.done)
+	}
+
+	run := &gameRun{done: make(chan struct{})}
+	e.currentRun = run
+	e.world = cloneWorld(req.World)
+	e.targetTurns = req.Turns
+	e.threads = req.Threads
+	e.completedTurns = 0
+	e.paused = false
+	e.pausedAtBoundary = false
+	e.finished = false
+	e.runError = ""
+	e.gameID = req.GameID
+	e.started = true
+	e.cond.Broadcast()
+	go e.run(run)
 	e.mu.Unlock()
-    //return result
-	if runError != "" {
-		return fmt.Errorf("game evolution failed: %s", runError)
+
+	<-run.done
+	reply.World = cloneWorld(run.world)
+	reply.CompletedTurns = run.completedTurns
+	if run.err != nil {
+		return run.err
 	}
 	return nil
 }
 
-func (e *Engine) run() {
+func (e *Engine) finishRunLocked(run *gameRun, err error) {
+	if e.currentRun != run {
+		return
+	}
+	e.finished = true
+	if err != nil {
+		e.runError = err.Error()
+	}
+	run.world = cloneWorld(e.world)
+	run.completedTurns = e.completedTurns
+	run.err = err
+	close(run.done)
+	e.cond.Broadcast()
+}
+
+func (e *Engine) run(run *gameRun) {
 	for {
 		e.mu.Lock()
-		for e.paused && !e.stopping {
+		if e.currentRun != run {
+			e.mu.Unlock()
+			return
+		}
+		for e.paused && !e.stopping && e.currentRun == run {
 			e.pausedAtBoundary = true
 			e.cond.Broadcast()
 			e.cond.Wait()
 		}
+		if e.currentRun != run {
+			e.mu.Unlock()
+			return
+		}
 		e.pausedAtBoundary = false
 
 		if e.stopping || e.completedTurns >= e.targetTurns {
-			e.finished = true
-			e.cond.Broadcast()
+			e.finishRunLocked(run, nil)
 			e.mu.Unlock()
 			return
 		}
@@ -245,21 +310,24 @@ func (e *Engine) run() {
 
 		if err != nil {
 			e.mu.Lock()
-			e.runError = err.Error()
-			e.finished = true
-			e.cond.Broadcast()
+			e.finishRunLocked(run, err)
 			e.mu.Unlock()
 			return
 		}
 
 		e.mu.Lock()
+		if e.currentRun != run {
+			e.mu.Unlock()
+			return
+		}
 		e.world = next
 		e.completedTurns = nextTurn
 		e.cond.Broadcast()
 		e.mu.Unlock()
 	}
 }
-//implement of different keyPresses
+
+// implement of different keyPresses
 func (e *Engine) Pause(_ Empty, reply *Snapshot) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -271,6 +339,7 @@ func (e *Engine) Pause(_ Empty, reply *Snapshot) error {
 			Paused:         e.paused,
 			Finished:       e.finished,
 			Error:          e.runError,
+			GameID:         e.gameID,
 		}
 		return nil
 	}
@@ -284,6 +353,7 @@ func (e *Engine) Pause(_ Empty, reply *Snapshot) error {
 		Paused:         e.paused,
 		Finished:       e.finished,
 		Error:          e.runError,
+		GameID:         e.gameID,
 	}
 	return nil
 }
@@ -299,6 +369,7 @@ func (e *Engine) Resume(_ Empty, reply *Snapshot) error {
 			Paused:         e.paused,
 			Finished:       e.finished,
 			Error:          e.runError,
+			GameID:         e.gameID,
 		}
 		return nil
 	}
@@ -311,6 +382,7 @@ func (e *Engine) Resume(_ Empty, reply *Snapshot) error {
 		Paused:         false,
 		Finished:       e.finished,
 		Error:          e.runError,
+		GameID:         e.gameID,
 	}
 	return nil
 }
@@ -345,7 +417,8 @@ func (e *Engine) Shutdown(_ Empty, reply *Empty) error {
 	}
 	return shutdownErr
 }
-//the parallel caculation method
+
+// the parallel caculation method
 func evolveOneTurn(world [][]uint8, threads int) [][]uint8 {
 	height := len(world)
 	if height == 0 {

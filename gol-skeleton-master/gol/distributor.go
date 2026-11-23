@@ -58,6 +58,7 @@ func distributor(p Params, c distributorChannels) {
 		World:   cloneWorld(world),
 		Turns:   p.Turns,
 		Threads: p.Threads,
+		GameID:  fmt.Sprintf("%d", time.Now().UnixNano()),
 	}
 
 	// RunGame blocks until all turns finish, so call it concurrently while the
@@ -86,7 +87,7 @@ func distributor(p Params, c distributorChannels) {
 
 	// Wait until the broker initializes the world. If RunGame finishes first, use
 	// its final result; otherwise, fetch snapshots until the world is available.
-	for len(state.World) == 0 {
+	for state.GameID != request.GameID {
 		select {
 		case result := <-runDone:
 			if result.err != nil {
@@ -97,6 +98,7 @@ func distributor(p Params, c distributorChannels) {
 				World:          result.result.World,
 				CompletedTurns: result.result.CompletedTurns,
 				Finished:       true,
+				GameID:         request.GameID,
 			}
 		case <-startupTicker.C:
 			state = fetchSnapshot()
@@ -203,6 +205,7 @@ func distributor(p Params, c distributorChannels) {
 				CompletedTurns: countReply.CompletedTurns,
 				Paused:         countReply.Paused,
 				Finished:       countReply.Finished,
+				GameID:         countReply.GameID,
 			}
 			applySnapshot(state)
 

@@ -1,4 +1,4 @@
-//to be honest, I create this file with ai cuz IDK how to test if engine works properly
+//to be honest, I create this file with ai
 
 package gol
 
@@ -83,6 +83,105 @@ func TestRunGameRPCReturnsFinalWorld(t *testing.T) {
 	}
 	if want := evolveOneTurn(world, 2); !reflect.DeepEqual(result.World, want) {
 		t.Fatal("RunGame returned an unexpected final world")
+	}
+}
+
+func TestRunGameCanRunSequentialGames(t *testing.T) {
+	engine := NewEngine()
+	worker := NewWorker()
+	if err := engine.SetWorkers([]string{startTestWorkerServer(t, worker)}); err != nil {
+		t.Fatal(err)
+	}
+
+	firstWorld := make([][]uint8, 4)
+	secondWorld := make([][]uint8, 4)
+	for y := range firstWorld {
+		firstWorld[y] = make([]uint8, 4)
+		secondWorld[y] = make([]uint8, 4)
+	}
+	firstWorld[1][0] = 255
+	firstWorld[1][1] = 255
+	firstWorld[1][2] = 255
+	secondWorld[0][0] = 255
+	secondWorld[2][2] = 255
+
+	requests := []EvolveRequest{
+		{World: firstWorld, Turns: 1, Threads: 2},
+		{World: secondWorld, Turns: 2, Threads: 1},
+	}
+	for i, request := range requests {
+		var result GameResult
+		if err := engine.RunGame(request, &result); err != nil {
+			t.Fatalf("RunGame %d failed: %v", i+1, err)
+		}
+		if result.CompletedTurns != request.Turns {
+			t.Fatalf("RunGame %d completed turns = %d, want %d", i+1, result.CompletedTurns, request.Turns)
+		}
+
+		want := cloneWorld(request.World)
+		for turn := 0; turn < request.Turns; turn++ {
+			want = evolveOneTurn(want, request.Threads)
+		}
+		if !reflect.DeepEqual(result.World, want) {
+			t.Fatalf("RunGame %d returned an unexpected world", i+1)
+		}
+	}
+
+	var shutdownReply Empty
+	if err := engine.Shutdown(Empty{}, &shutdownReply); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunGameReplacesActiveGame(t *testing.T) {
+	engine := NewEngine()
+	firstWorld := make([][]uint8, 64)
+	for y := range firstWorld {
+		firstWorld[y] = make([]uint8, 64)
+	}
+
+	firstResult := make(chan error, 1)
+	go func() {
+		var result GameResult
+		firstResult <- engine.RunGame(EvolveRequest{
+			World: firstWorld,
+			Turns: 1_000_000,
+		}, &result)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	activeGameObserved := false
+	for time.Now().Before(deadline) {
+		var snapshot Snapshot
+		if err := engine.GetSnapshot(Empty{}, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.CompletedTurns > 0 {
+			activeGameObserved = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !activeGameObserved {
+		t.Fatal("first game did not start before the deadline")
+	}
+
+	secondWorld := [][]uint8{{255, 0}, {0, 255}}
+	var secondResult GameResult
+	if err := engine.RunGame(EvolveRequest{
+		World: secondWorld,
+		Turns: 1,
+	}, &secondResult); err != nil {
+		t.Fatal(err)
+	}
+	if secondResult.CompletedTurns != 1 {
+		t.Fatalf("second game completed turns = %d, want 1", secondResult.CompletedTurns)
+	}
+	if want := evolveOneTurn(secondWorld, 1); !reflect.DeepEqual(secondResult.World, want) {
+		t.Fatal("second game returned an unexpected world")
+	}
+	if err := <-firstResult; err == nil {
+		t.Fatal("replaced game did not return an error")
 	}
 }
 
