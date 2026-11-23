@@ -47,6 +47,18 @@ func distributor(p Params, c distributorChannels) {
 		panic(fmt.Errorf("connect to Game of Life engine: %w", err))
 	}
 	defer client.Close()
+
+	var initialKey rune
+	hasInitialKey := false
+	select {
+	case key, ok := <-c.keyPress:
+		if ok {
+			initialKey = key
+			hasInitialKey = true
+		}
+	default:
+	}
+
 	// runResponse carries the blocking RunGame RPC result back to the distributor loop,
 	// so it can keep handling key presses and progress events while the call is in flight.
 	type runResponse struct {
@@ -55,10 +67,11 @@ func distributor(p Params, c distributorChannels) {
 	}
 	runDone := make(chan runResponse, 1)
 	request := EvolveRequest{
-		World:   cloneWorld(world),
-		Turns:   p.Turns,
-		Threads: p.Threads,
-		GameID:  fmt.Sprintf("%d", time.Now().UnixNano()),
+		World:       cloneWorld(world),
+		Turns:       p.Turns,
+		Threads:     p.Threads,
+		GameID:      fmt.Sprintf("%d", time.Now().UnixNano()),
+		StartPaused: hasInitialKey && initialKey == 'p',
 	}
 
 	// RunGame blocks until all turns finish, so call it concurrently while the
@@ -110,7 +123,7 @@ func distributor(p Params, c distributorChannels) {
 	// by the time its first snapshot reaches the controller.
 	world = cloneWorld(request.World)
 	turn := 0
-	paused := false
+	paused := request.StartPaused
 
 	for y := range world {
 		for x, cell := range world[y] {
@@ -124,6 +137,9 @@ func distributor(p Params, c distributorChannels) {
 	}
 	c.events <- TurnComplete{CompletedTurns: 0}
 	c.events <- StateChange{CompletedTurns: 0, NewState: Executing}
+	if paused {
+		c.events <- StateChange{CompletedTurns: 0, NewState: Paused}
+	}
 
 	aliveTicker := time.NewTicker(2 * time.Second)
 	defer aliveTicker.Stop()
@@ -170,6 +186,68 @@ func distributor(p Params, c distributorChannels) {
 		finish(state)
 		return
 	}
+
+	var queuedKeys <-chan rune
+	if hasInitialKey && !request.StartPaused {
+		initialKeys := make(chan rune, 1)
+		initialKeys <- initialKey
+		queuedKeys = initialKeys
+	}
+
+	handleKey := func(key rune) bool {
+		switch key {
+		case 'p':
+			method := "GolEngine.Pause"
+			if paused {
+				method = "GolEngine.Resume"
+			}
+			var snapshot Snapshot
+			if err := client.Call(method, Empty{}, &snapshot); err != nil {
+				panic(fmt.Errorf("change engine pause state: %w", err))
+			}
+			if snapshot.Error != "" {
+				panic(fmt.Errorf("engine computation failed: %s", snapshot.Error))
+			}
+			applySnapshot(snapshot)
+			paused = snapshot.Paused
+			newState := Executing
+			if paused {
+				newState = Paused
+				log.Printf("Paused at turn %d", turn)
+			} else {
+				log.Print("Continuing")
+			}
+			c.events <- StateChange{turn, newState}
+
+		case 's':
+			snapshot := fetchSnapshot()
+			outputWorld(c, snapshot.World, snapshot.CompletedTurns)
+
+		case 'q':
+			snapshot := fetchSnapshot()
+			outputWorld(c, snapshot.World, snapshot.CompletedTurns)
+			c.events <- StateChange{snapshot.CompletedTurns, Quitting}
+			return true
+
+		case 'k':
+			var shutdownReply Empty
+			if err := client.Call("GolEngine.Shutdown", Empty{}, &shutdownReply); err != nil {
+				panic(fmt.Errorf("shut down Game of Life engine: %w", err))
+			}
+			result := <-runDone
+			if result.err != nil {
+				panic(fmt.Errorf("run game via RPC: %w", result.err))
+			}
+			finish(Snapshot{
+				World:          result.result.World,
+				CompletedTurns: result.result.CompletedTurns,
+				Finished:       true,
+			})
+			return true
+		}
+		return false
+	}
+
 	//keep tracking runDown, aliveTicker and keyPress
 	for {
 		select {
@@ -215,60 +293,18 @@ func distributor(p Params, c distributorChannels) {
 				c.events <- StateChange{turn, newState}
 			}
 
+		case key := <-queuedKeys:
+			queuedKeys = nil
+			if handleKey(key) {
+				return
+			}
+
 		case key, ok := <-c.keyPress:
 			if !ok {
 				c.keyPress = nil
 				continue
 			}
-
-			switch key {
-			case 'p':
-				method := "GolEngine.Pause"
-				if paused {
-					method = "GolEngine.Resume"
-				}
-				var snapshot Snapshot
-				if err := client.Call(method, Empty{}, &snapshot); err != nil {
-					panic(fmt.Errorf("change engine pause state: %w", err))
-				}
-				if snapshot.Error != "" {
-					panic(fmt.Errorf("engine computation failed: %s", snapshot.Error))
-				}
-				applySnapshot(snapshot)
-				paused = snapshot.Paused
-				newState := Executing
-				if paused {
-					newState = Paused
-					log.Printf("Paused at turn %d", turn)
-				} else {
-					log.Print("Continuing")
-				}
-				c.events <- StateChange{turn, newState}
-
-			case 's':
-				snapshot := fetchSnapshot()
-				outputWorld(c, snapshot.World, snapshot.CompletedTurns)
-
-			case 'q':
-				snapshot := fetchSnapshot()
-				outputWorld(c, snapshot.World, snapshot.CompletedTurns)
-				c.events <- StateChange{snapshot.CompletedTurns, Quitting}
-				return
-
-			case 'k':
-				var shutdownReply Empty
-				if err := client.Call("GolEngine.Shutdown", Empty{}, &shutdownReply); err != nil {
-					panic(fmt.Errorf("shut down Game of Life engine: %w", err))
-				}
-				result := <-runDone
-				if result.err != nil {
-					panic(fmt.Errorf("run game via RPC: %w", result.err))
-				}
-				finish(Snapshot{
-					World:          result.result.World,
-					CompletedTurns: result.result.CompletedTurns,
-					Finished:       true,
-				})
+			if handleKey(key) {
 				return
 			}
 		}

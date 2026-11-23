@@ -8,10 +8,11 @@ import (
 )
 
 type EvolveRequest struct {
-	World   [][]uint8
-	Turns   int
-	Threads int
-	GameID  string
+	World       [][]uint8
+	Turns       int
+	Threads     int
+	GameID      string
+	StartPaused bool
 }
 
 // Empty is an empty struct used for RPC methods that do not require any input parameters.
@@ -185,6 +186,8 @@ func (e *Engine) StartEvolution(req EvolveRequest, reply *StartReply) error {
 	e.targetTurns = req.Turns
 	e.threads = req.Threads
 	e.completedTurns = 0
+	e.paused = req.StartPaused
+	e.pausedAtBoundary = false
 	e.gameID = req.GameID
 	e.started = true
 	run := &gameRun{done: make(chan struct{})}
@@ -234,7 +237,7 @@ func (e *Engine) RunGame(req EvolveRequest, reply *GameResult) error {
 	e.targetTurns = req.Turns
 	e.threads = req.Threads
 	e.completedTurns = 0
-	e.paused = false
+	e.paused = req.StartPaused
 	e.pausedAtBoundary = false
 	e.finished = false
 	e.runError = ""

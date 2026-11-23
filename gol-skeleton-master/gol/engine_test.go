@@ -185,6 +185,62 @@ func TestRunGameReplacesActiveGame(t *testing.T) {
 	}
 }
 
+func TestRunGameCanStartPaused(t *testing.T) {
+	engine := NewEngine()
+	world := make([][]uint8, 8)
+	for y := range world {
+		world[y] = make([]uint8, 8)
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		var result GameResult
+		resultCh <- engine.RunGame(EvolveRequest{
+			World:       world,
+			Turns:       2,
+			Threads:     2,
+			GameID:      "start-paused",
+			StartPaused: true,
+		}, &result)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var snapshot Snapshot
+		if err := engine.GetSnapshot(Empty{}, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.GameID == "start-paused" && snapshot.Paused {
+			if snapshot.CompletedTurns != 0 {
+				t.Fatalf("completed turns while initially paused = %d, want 0", snapshot.CompletedTurns)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var snapshot Snapshot
+	if err := engine.GetSnapshot(Empty{}, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.GameID != "start-paused" || !snapshot.Paused {
+		t.Fatal("engine did not enter the requested initial paused state")
+	}
+	var resumeReply Snapshot
+	if err := engine.Resume(Empty{}, &resumeReply); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("game did not finish after resuming")
+	}
+}
+
 func TestEngineCanPauseResumeAndShutdown(t *testing.T) {
 	engine := NewEngine()
 	world := make([][]uint8, 64)
