@@ -106,9 +106,11 @@ func distributor(p Params, c distributorChannels) {
 	}
 	startupTicker.Stop()
 
-	world = state.World
-	turn := state.CompletedTurns
-	paused := state.Paused
+	// Report the input board as turn 0; the broker may already have advanced
+	// by the time its first snapshot reaches the controller.
+	world = cloneWorld(request.World)
+	turn := 0
+	paused := false
 
 	for y := range world {
 		for x, cell := range world[y] {
@@ -120,13 +122,8 @@ func distributor(p Params, c distributorChannels) {
 			}
 		}
 	}
-	c.events <- TurnComplete{CompletedTurns: turn}
-
-	currentState := Executing
-	if paused {
-		currentState = Paused
-	}
-	c.events <- StateChange{turn, currentState}
+	c.events <- TurnComplete{CompletedTurns: 0}
+	c.events <- StateChange{CompletedTurns: 0, NewState: Executing}
 
 	aliveTicker := time.NewTicker(2 * time.Second)
 	defer aliveTicker.Stop()
